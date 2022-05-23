@@ -1,0 +1,91 @@
+---
+title: Fastly caching basics
+date: 2021-05-23
+description: Different ways of caching pages with Fastly.
+tags:
+  - Tutorial
+  - Caching
+  - Varnish
+banner: ./fastly_logo.png
+---
+
+# Preface
+
+Fastly is many things: CDN, compute at edge, proxy and WAF. It is an implementation of Varnish language which gives a powerful abstraction over request/process/response flow. The goal of this series of blog posts is to cover all applications of Fastly that we heavily utilize in CouponFollow and which helped us to succeed.
+
+In couponfollow we're devoted to providing smooth experience blah blah blah, speed makes good rank in google and helps click through rate.
+
+> ### Disclaimer:
+> We’ll focus on a high traffic website with various low and high computed pages and small subset of apis for client side scripting. Setup for other types of web application, like for example video streaming may be completely different. 
+
+# Caching theory
+
+Important for speed, geographically distributed. Takes off load from origin. 
+
+## Caching time
+
+- Rarely used and/or rarely changing pages can have long caching period or cache can be programatically invalidated on demand from backend process
+- Up to date pages – 5min to 30min – still worth for heavy computing that occurs on origin
+- Static assets – cleared only on demand
+
+## Cashing strategy
+
+- Some pages can be cached in a single form for all users/devices – responsive about page
+- Some pages should not be cached on server at all – like API endpoint or consider user profile page /account/profile which would cache for 30 min for all users – everyone would get access to data of user that caused request on origin
+- Adaptive version of heavily computed page – /site/macys.com rendered on server for mobile should not be served to desktop, this is where vary-by kicks in. It gives you parallel cache entries for the same request path but takes given vary as a factor when calculating cache entry. So in case of site page, there will be two cache entries (one for desktop and one for mobile) because we set vary-by to a normalized UA.
+- I can imagine other vary-bys, like language or custom header for A/B testing.
+
+# Demo
+
+To illustrate some basic caching concepts and to dive into more sophisticated Fastly features we need a demo web app configured in free Fastly account. We'll be expanding this app along the course with new endpoints and more code as needed to demo new things. 
+
+## AspNet Core MVC app
+
+This is vanilla .NET Core 6 app that will expose few endpoints that will demonstrate cache and other Fastly features. For the purpose of this demo, we want two endpoints `Foo` and `Bar` that will be cached and not cached respectively. Since caching is default behavior, we'll just adjust the caching period to 60s in the `Foo`. For `Bar` we'll introduce a varnish code snippet in Fastly configuration to prevent it from being cached.
+
+### Caching Foo
+
+Pages are cached to 10 min by default. That applies to pages that don't set cookies, which may be a caveat. We also ran into this issue many times since azure app services set affinity cookie by default.
+To fine-tune what to cache and for how long you need to know that Fastly recognizes standard http headers: Cache-control and Surrogate-control. You configure cashing by setting `Surrogate-Control` either in backend code or in varnish.
+
+```
+context.HttpContext.Response.Headers.Add("Surrogate-Control", $"max-age={MaxAge}");
+```
+
+It is easy enough to expire cache on Fastly side using UI or API but remember that you have no control over client cache. To have full control, you may also want to prevent storing content on client side with:
+
+```
+context.HttpContext.Response.Headers["Cache-Control"] = "no-store, max-age=0";
+```
+
+### Other way cache config
+
+Since I mentioned that Fastly implements varnish, lets also see how to set 30min cache for all urls matching /site pattern
+
+```
+if (req.url.path ~ "(?i)^/site/) {
+  set beresp.http.Surrogate-Control = "max-age=31536000"; # Rules for downstream Fastly caches
+}
+```
+
+## Preventing caching for some pages
+
+How to avoid caching:
+- cache-control: private set in code
+- cache setting from Fastly UI as described here: https://docs.fastly.com/en/guides/controlling-caching#conditionally-preventing-pages-from-caching. Note that this will translate into varnish under the hood.
+- snippet on recv
+
+Since we already configured cache in C# code, let's prevent caching in Varnish. Add new recv snippet like that:
+
+```
+if (req.url ~ "(?i)^/home/bar") {
+    return(pass);
+}
+```
+
+
+Normalization is important factor since without it you would end up with a lot of separate cache entries (for each UA) and very poor hit ratio.
+
+Digression:
+
+Worth to note that good cache setup can also "improve your SLA". Consider a perfect caching setup of you site and perfect timing. Cache is full and up-to-date and we use some magic to remove origin. Users would see no or very little difference until first (shortest lived) cache would expire. It would be nice if Fastly could detect origin being unavailable or malfunctioning and keep serving last cache entries until origin comes back online. Fastly has that feature and it is called stale on error. 
